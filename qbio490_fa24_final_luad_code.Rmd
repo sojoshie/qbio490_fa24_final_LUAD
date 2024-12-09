@@ -1,0 +1,616 @@
+---
+title: "QBIO490 Fall 2024 Final Lung Adenocarcinoma Code"
+output: html_notebook
+authors: Joshua Lin, Ethen Chen, Changshen Chen, with assistance from Wade Boohar and Mahija Mogalipuvu
+---
+
+```{r setup}
+dir.create(“/home1/ethenche/490_cluster/qbio490_fa24_final_LUAD/outputs”)
+knitr::opts_knit$set(root.dir = normalizePath("/home1/ethenche/490_cluster/qbio490_fa24_final_LUAD/outputs"))
+```
+
+```{r}
+# Installing and Loading Needed Libraries/Packages
+if (!require("knitr", quietly = TRUE)) install.packages("knitr")
+
+if (!require("BiocManager")) install.packages("BiocManager")
+BiocManager::install(version = "3.19")
+
+if (!require("TCGAbiolinks", quietly = TRUE)) BiocManager::install("TCGAbiolinks")
+
+if(!require("ggplot2")) install.packages("ggplot2")
+
+if (!require("maftools", quietly = TRUE)) BiocManager::install("maftools")
+
+if (!require('survival')) install.packages("survival")
+
+if (!require('survminer')) install.packages("survminer")
+
+if (!require("DESeq2", quietly = TRUE)) BiocManager::install("DESeq2")
+
+if (!require("EnhancedVolcano", quietly = TRUE)) BiocManager::install("EnhancedVolcano")
+
+if (!require("SummarizedExperiment", quietly = TRUE)) BiocManager::install("SummarizedExperiment")
+
+if (!require("sesameData", quietly = TRUE)) BiocManager::install("sesameData")
+
+if (!require("sesame", quietly = TRUE)) BiocManager::install("sesame")
+
+if (!require("limma", quietly = TRUE)) BiocManager::install("limma")
+
+if(!require("glue")) install.packages("glue")
+
+library(BiocManager)
+library(TCGAbiolinks)
+library(ggplot2)
+library(maftools)
+library(survival)
+library(survminer)
+library(DESeq2)
+library(EnhancedVolcano)
+library(SummarizedExperiment)
+library(sesame)
+library(sesameData)
+library(limma)
+library(glue)
+
+# Download, Query, and Load the Clinical data
+clin_query <- GDCquery(project = "TCGA-LUAD",
+data.category = "Clinical",
+data.type = "Clinical Supplement",
+data.format = 'BCR Biotab')
+GDCdownload(clin_query)
+clinical.BCRtab.all <- GDCprepare(clin_query)
+  
+clinic <- clinical.BCRtab.all$clinical_patient_luad[-c(1,2),]
+
+colnames(clinic)[ colnames(clinic) == "bcr_patient_barcode" ] <- "Tumor_Sample_Barcode"
+clinical <- clinic
+
+# Download the mutation data
+maf_query <- GDCquery(
+  project = 'TCGA-LUAD',
+  data.category = "Simple Nucleotide Variation",
+  access = "open", # we only have access to somatic mutations which are open access
+  data.type = "Masked Somatic Mutation",
+  workflow.type = "Aliquot Ensemble Somatic Variant Merging and Masking"
+)
+
+GDCdownload(maf_query)
+
+maf <- GDCprepare(maf_query) # as long as it runs, ignore any errors
+
+maf_object <- read.maf(maf = maf,
+                       clinicalData = clinical, 
+                       isTCGA = TRUE)
+# Download the transcriptomics data
+rna_query <- GDCquery(project ="TCGA-LUAD",
+                      data.category = "Transcriptome Profiling",
+                      data.type = "Gene Expression Quantification",
+                      workflow.type = "STAR - Counts")
+GDCdownload(rna_query)
+rna_se <- GDCprepare(rna_query)
+
+# Download the epigenomics data
+ query <- GDCquery(project = "TCGA-LUAD",
+                  data.category = "DNA Methylation",
+                  data.type = "Methylation Beta Value",
+                  platform = "Illumina Human Methylation 450",
+                  data.format = "Dataframe")
+GDCdownload(query)
+methylation450 <- GDCprepare(query)
+```
+
+
+Below is all the codes for the clinic part of the code
+```{r}
+#masking NAs in vital status
+vital_status_na_mask <- !is.na(clinic$vital_status)
+cleaned_clinic <- clinic[vital_status_na_mask, ]
+
+#filtering non-smokers from patients whose pack years are not available
+cleaned_clinic$tobacco_smoking_pack_years_smoked <- ifelse(
+  cleaned_clinic$tobacco_smoking_history_indicator == 1 & cleaned_clinic$tobacco_smoking_pack_years_smoked == "[Not Available]",
+  0,
+  cleaned_clinic$tobacco_smoking_pack_years_smoked
+)
+
+#categorize patients based on their pack years
+cleaned_clinic$tobacco_smoking_pack_years_smoked <- as.numeric(cleaned_clinic$tobacco_smoking_pack_years_smoked)
+cleaned_clinic$smoking_category <- ifelse(
+cleaned_clinic$tobacco_smoking_pack_years_smoked == 0, "Non-smoker",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 0 & cleaned_clinic$tobacco_smoking_pack_years_smoked <= 5, "Minimal exposure",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 5 & cleaned_clinic$tobacco_smoking_pack_years_smoked <= 10, "Mild exposure",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 10 & cleaned_clinic$tobacco_smoking_pack_years_smoked <= 20, "Moderate exposure",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 20, "Heavy exposure", NA)))))
+
+#masking NAs in smoking categories
+smoking_mask <- !is.na(cleaned_clinic$smoking_category)
+cleaned_clinic <- cleaned_clinic[smoking_mask, ]
+
+
+#creating survival time column by replacing NAs in death day counts by last contact day counts
+cleaned_clinic$death_days_to[cleaned_clinic$death_days_to == "[Not Applicable]"] <- NA
+
+cleaned_clinic$survival_time <- ifelse(is.na(cleaned_clinic$death_days_to),
+                                       cleaned_clinic$last_contact_days_to,
+                                       cleaned_clinic$death_days_to)
+
+#masking NAs in survical time
+cleaned_clinic$survival_time <- as.numeric(cleaned_clinic$survival_time)
+cleaned_clinic <- cleaned_clinic[!is.na(cleaned_clinic$survival_time), ]
+
+#processing death event column
+cleaned_clinic$death_event <-  ifelse(cleaned_clinic$vital_status == "Dead", TRUE, FALSE)
+
+survival_object <- Surv(time = cleaned_clinic$survival_time,
+                        event = cleaned_clinic$death_event)
+
+fit_object <- survfit(survival_object ~ smoking_category, data = cleaned_clinic)
+```
+
+
+```{r}
+# Plotting the KM plot
+survplot <- ggsurvplot(fit_object,
+                       pval=TRUE,
+                       ggtheme = theme(plot.margin = unit(c(1,1,1,1), "cm")),
+                       legend = 'right')
+
+KM_plot <- survplot$plot + theme_bw() + theme(axis.title = element_text(size=20), 
+                                              axis.text = element_text(size=16),
+                                              legend.title = element_text(size=14),
+                                              legend.text = element_text(size=12))
+
+KM_plot
+```
+Below are the code chunks for genomic data
+
+Clinical variable used to separate into 2 diff groups (non-smoker + heavy exposure)
+Non-smoker = 0 smoking pack years or smoking history indicator of 1 and "not available" smoking pack years, Heavy exposure > 20 smoking pack years
+Subsetting maf_object into non-smoker and heavy exposure groups
+```{r}
+# smoking category = Non-smoker, Heavy exposure or NA
+maf_object@clinical.data$smoking_category <- ifelse((maf_object@clinical.data$tobacco_smoking_age_started == 0 | (maf_object@clinical.data$tobacco_smoking_history_indicator == 1 & maf_object@clinical.data$tobacco_smoking_pack_years_smoked == "[Not Available]")), 'Non-smoker', ifelse(maf_object@clinical.data$tobacco_smoking_pack_years_smoked > 20, 'Heavy exposure', NA))
+
+# Factor smoking category
+maf_object@clinical.data$smoking_category <- factor(maf_object@clinical.data$smoking_category)
+
+# Remove NAs (non non-smoker or heavy exposure)
+maf_object@clinical.data <- maf_object@clinical.data[!is.na(maf_object@clinical.data$smoking_category), ]
+
+# Subset non_smoker maf
+non_smoker_mask <- maf_object@clinical.data$smoking_category == 'Non-smoker'
+non_smoker_barcode <- maf_object@clinical.data$Tumor_Sample_Barcode[non_smoker_mask]
+non_smoker_maf <- subsetMaf(maf = maf_object, tsb = non_smoker_barcode)
+
+# Subset heavy exposure maf
+heavy_exposure_mask <- maf_object@clinical.data$smoking_category == 'Heavy exposure'
+heavy_exposure_barcode <- maf_object@clinical.data$Tumor_Sample_Barcode[heavy_exposure_mask]
+heavy_exposure_maf <- subsetMaf(maf = maf_object, tsb = heavy_exposure_barcode)
+```
+Co-oncoplot with top 10 most mutated genes for non-smoking + most-exposed groups
+```{r}
+# Config to get only top 10 most mutated genes for both subset mafs
+non_smoker_maf.genes = getGeneSummary(non_smoker_maf)[1:10]
+heavy_exposure_maf.genes = getGeneSummary(heavy_exposure_maf)[1:10]
+mdt = merge(non_smoker_maf.genes[,.(Hugo_Symbol, MutatedSamples)], heavy_exposure_maf.genes[,.(Hugo_Symbol, MutatedSamples)], by = 'Hugo_Symbol', all = TRUE)
+mdt$MutatedSamples.x[is.na(mdt$MutatedSamples.x)] = 0
+mdt$MutatedSamples.y[is.na(mdt$MutatedSamples.y)] = 0
+mdt$max = apply(mdt[,.(MutatedSamples.x, MutatedSamples.y)], 1, max)
+mdt = mdt[order(max, decreasing = TRUE)]
+
+# CoOncoplot
+coOncoplot(m1 = non_smoker_maf,
+           m2 = heavy_exposure_maf,
+           m1Name = "Non-Smoker",
+           m2Name = "Heavy exposure",
+           anno_height = 2,
+           outer_mar = 2,
+           barcode_mar = 2,
+           geneNamefont = 0.6,
+           gene_mar = 0.5,
+           titleFontSize = 0.8,
+           borderCol = NA)
+
+ggsave("/cooncoplot_NonSmoker_HeavyExposure.jpg")
+```
+Contingency table using mosaicplot + fisher's exact test
+```{r}
+# Subset Maf based on the specific gene
+#gene_maf <- subsetMaf(maf = maf_object, genes = 'TP53')
+#muts_gene <- gene_maf@clinical.data$Tumor_Sample_Barcode
+#nums_gene <- length(muts_gene)
+
+# Gene (TP53) Mutation Column - w/ help from Mahija Mogalipuvu
+gene_mask <- maf_object@data$Hugo_Symbol == 'TP53'
+gene_barcode <- maf_object@data$Tumor_Sample_Barcode[gene_mask]
+maf_object@clinical.data$gene_mutation <- maf_object@clinical.data$Tumor_Sample_Barcode %in% gene_barcode # Returns true if patient has mutation for gene
+
+# Contingency table w/ mosaic plot based on smoking_category and the specific gene
+contig <- table(maf_object@clinical.data$smoking_category, maf_object@clinical.data$gene_mutation)
+mosaicplot(contig)
+ggsave('/MosaicPlot_Contig_TP53_NonSmoker_HeavyExposure.jpg')
+
+# Fisher's Exact Test based on contingency table
+fisher_test <- fisher.test(contig)
+fisher_test
+
+# P value = 0.2227 > 0.05; not significant
+"output: Fisher's Exact Test for Count Data
+
+data:  contig
+p-value = 0.2227
+alternative hypothesis: true odds ratio is not equal to 1
+95 percent confidence interval:
+ 0.3890501 1.2232091
+sample estimates:
+odds ratio 
+ 0.6930737
+"
+```
+Colollipop plot for 2 populations for specific gene
+```{r}
+lollipopPlot2(m1 = non_smoker_maf, 
+              m2 = heavy_exposure_maf, 
+              m1_name = 'Non-Smoker',
+              m2_name = 'Heavy Exposure',
+              gene = 'TP53')
+
+ggsave("/colollipop_TP53_NonSmoker_HeavyExposure.jpg")
+```
+mafSurvival KM Plot based on mutations of specific gene
+```{r}
+# Maf object for only specific gene (TP53)
+maf_object <- read.maf(maf = maf, clinicalData = clinic, isTCGA = TRUE)
+
+# Gene (TP53) Mutation Column w/ help from Mahija Mogalipuvu
+gene_mask <- maf_object@data$Hugo_Symbol == 'TP53'
+gene_barcode <- maf_object@data$Tumor_Sample_Barcode[gene_mask]
+maf_object@clinical.data$gene_mutation <- maf_object@clinical.data$Tumor_Sample_Barcode %in% gene_barcode # Returns true if patient has mutation for gene
+
+# Survival Time Column (numeric)
+maf_object@clinical.data$survival_time <- ifelse(maf_object@clinical.data$vital_status == "Dead", maf_object@clinical.data$death_days_to, maf_object@clinical.data$last_contact_days_to)
+maf_object@clinical.data$survival_time <- as.numeric(maf_object@clinical.data$survival_time)
+
+# Remove those with NAs from survival_time
+maf_object@clinical.data <- maf_object@clinical.data[(!is.na(maf_object@clinical.data$survival_time)), ]
+
+# Death Event Column
+maf_object@clinical.data$death_event <- ifelse(maf_object@clinical.data$vital_status == "Dead", T, F)
+
+# mafSurvival KM Plot for gene
+mafSurvival(maf = maf_object,
+            genes = 'TP53',
+            time = 'survival_time',
+            Status = 'death_event',
+            isTCGA = TRUE)
+
+ggsave('/mafSurvival_KM_TP53.jpg')
+
+"
+
+Group
+<chr>
+medianTime
+<dbl>
+N
+<int>
+Mutant	202	241		
+WT	254	246
+
+TP53 
+ 276 
+"
+```
+
+
+```{r}
+rna_clinical <-as.data.frame(rna_se@colData)#get rna_clinical dataframe
+column_mask <- ifelse(colnames(rna_clinical)  %in% c("treatments", "primary_site", "disease_type"), F, T) #clean the rna_clinical dataframe
+rna_clinical <- rna_clinical[,column_mask]
+rna_genes <- rna_se@rowRanges@elementMetadata # get rna_genes dataframe 
+rna_genes <- as.data.frame(rna_genes)
+rna_counts <- rna_se@assays@data$unstranded# get rna_counts dataframe, also substitute it's column names with the Tumor Sample Barcode of adapted_clinical which will be introduced later and its row names as the gene_id column at the rna_genes
+rna_counts<- as.data.frame(rna_counts)
+colnames(rna_counts) <- adapted_clinical$Tumor_Sample_Barcode
+rownames(rna_counts) <- rna_genes$gene_id
+```
+
+```{r}
+#the following code chunk is for cleaning and sorting the clinic data frame
+#masking NAs in vital status
+vital_status_na_mask <- !is.na(clinic$vital_status)
+cleaned_clinic <- clinic[vital_status_na_mask, ]
+
+#filtering non-smokers from patients whose pack years are not available
+cleaned_clinic$tobacco_smoking_pack_years_smoked <- ifelse(
+  cleaned_clinic$tobacco_smoking_history_indicator == 1 & cleaned_clinic$tobacco_smoking_pack_years_smoked == "[Not Available]",
+  0,
+  cleaned_clinic$tobacco_smoking_pack_years_smoked
+)
+
+#categorize patients based on their pack years
+cleaned_clinic$tobacco_smoking_pack_years_smoked <- as.numeric(cleaned_clinic$tobacco_smoking_pack_years_smoked)
+cleaned_clinic$smoking_category <- ifelse(
+cleaned_clinic$tobacco_smoking_pack_years_smoked == 0, "Non-smoker",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 0 & cleaned_clinic$tobacco_smoking_pack_years_smoked <= 5, "Minimal exposure",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 5 & cleaned_clinic$tobacco_smoking_pack_years_smoked <= 10, "Mild exposure",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 10 & cleaned_clinic$tobacco_smoking_pack_years_smoked <= 20, "Moderate exposure",
+ifelse(cleaned_clinic$tobacco_smoking_pack_years_smoked > 20, "Heavy exposure", NA)))))
+
+#masking NAs in smoking categories
+smoking_mask <- !is.na(cleaned_clinic$smoking_category)
+cleaned_clinic <- cleaned_clinic[smoking_mask, ]
+
+
+
+
+
+
+```
+
+
+```{r}
+row.names(cleaned_clinic) <- cleaned_clinic$Tumor_Sample_Barcode
+adapted_clinical <- cleaned_clinic[rna_clinical$patient,]#this code is used to match up the columns in rna_clinical with the columns in cleaned_clinic since we used some column that is only present in the cleaned_clinic data frame but not present in the rna_clinical data frame when we are sorting the non-smoker and Heavy exposure patients.
+adapted_clinical_na_mask <- !is.na(adapted_clinical$bcr_patient_uuid)
+adapted_clinical_cleaned <- adapted_clinical[adapted_clinical_na_mask, ]#this code is used the mask out all the NA values in the bcr_patient_uuid column, essentially masking the patients that does not belong to the cleaned_clinic out.
+adapted_clinical_cleaned$smoking_category <- ifelse(adapted_clinical_cleaned$smoking_category == "Heavy exposure", "Heavy exposure", ifelse(adapted_clinical_cleaned$smoking_category == "Non-smoker", "Non-smoker", "Neither"))
+neitherMask <- ifelse(adapted_clinical_cleaned$smoking_category == "Neither", F, T)
+adapted_clinical_cleaned <- adapted_clinical_cleaned[neitherMask, ]
+
+rna_counts_na_mask <- ifelse(colnames(rna_counts)%in%adapted_clinical_cleaned$Tumor_Sample_Barcode, T, F)
+rna_counts_cleaned <- rna_counts[,rna_counts_na_mask]
+#cleanning rna_counts using the rownames in adapted_clinical_cleaned data frame
+
+
+adapted_clinical_cleaned$smoking_category <- factor(adapted_clinical_cleaned$smoking_category) #factorizing the smoking category for later DESeq2 analysis
+
+
+
+#for gender:
+gender_na_mask <- ifelse(adapted_clinical_cleaned$gender == "[Not Available]", FALSE,
+TRUE)
+adapted_clinical_cleaned <- adapted_clinical_cleaned[gender_na_mask,]
+rna_counts_cleaned <- rna_counts_cleaned[, gender_na_mask]
+
+adapted_clinical_cleaned$gender <- factor(adapted_clinical_cleaned$gender)
+# masking out all the patients having NA gender for both adapted_clinical_clean and rna_counts_clean and factorize the gender for adapted_clinical_clean for DESeq2 analysis.
+#for race:
+age_na_mask <- ifelse(adapted_clinical_cleaned$age_at_initial_pathologic_diagnosis == "[Not Available]", FALSE,
+TRUE)
+adapted_clinical_cleaned <- adapted_clinical_cleaned[age_na_mask,]
+rna_counts_cleaned <- rna_counts_cleaned[, age_na_mask]
+adapted_clinical_cleaned$age_at_initial_pathologic_diagnosis <- as.numeric(adapted_clinical_cleaned$age_at_initial_pathologic_diagnosis)
+
+# masking out all the patients having NA age for both adapted_clinical_clean and rna_counts_clean for DESeq2 analysis and convert age into numeric.
+
+
+
+
+
+# pre-filtering genes
+
+
+
+less_20_mask <- rowSums(rna_counts_cleaned) >=20
+rna_counts_cleaned<- rna_counts_cleaned[less_20_mask,]
+rna_tpm_cleaned <- rna_tpm_cleaned[less_20_mask, ]
+rna_genes_cleaned <- rna_genes[less_20_mask,]
+#masking out all the genes that have a sum of less than 20 in both rna_counts_cleaned and also rna_genes
+
+```
+
+```{r}
+#running the real DESeqData here, using gender, vital_status, and race as covariates and smoking as variate.
+dds <- DESeqDataSetFromMatrix(countData = rna_counts_cleaned,
+                              colData = adapted_clinical_cleaned,
+                              design= ~gender + age_at_initial_pathologic_diagnosis + smoking_category)
+
+dds_obj <- DESeq(dds)
+
+resultsNames(dds_obj)
+
+results <- results(dds_obj, format = "DataFrame", 
+                   contrast = c("smoking_category", "Heavy exposure", "Non-smoker" ))
+
+results <- data.frame(results)
+#analyze and get the results dataframe
+```
+
+
+```{r}
+#assigning the gene names to results dataframe
+#assigning the -log10 values
+results[, "-log10(padj)"] <- -log10(results$padj)
+results[, "gene_name"] <- rna_genes_cleaned$gene_name
+```
+
+```{r}
+#generating the enhanced volcano plot
+EnhancedVolcano(results,
+                lab = results$gene_name,
+                x = "log2FoldChange",
+                y = "padj",
+                title = "Definition: Heavy exposure vs. Non Smoker",
+                pointSize = 1.0,
+                labSize = 5.0)
+```
+
+
+```{r}
+methylation_clinical <- as.data.frame(methylation450@colData)
+betas <- as.data.frame(methylation450@assays@data@listData)
+cpg_sites <- as.data.frame(methylation450@rowRanges@elementMetadata)
+#getting those dataframes in the environment from the methylation data downloaded from TCGA
+
+column_mask <- ifelse(colnames(methylation_clinical) %in% c('treatments', 'primary_site', 'disease_type'), F, T)
+methylation_clinical <- methylation_clinical[,column_mask]
+# mask out the list values in methylation_clinical so we can write it as a csv
+
+
+site_mask <- !grepl('-', cpg_sites$gene) & !grepl(';', cpg_sites$gene) & !is.na(cpg_sites$gene) & complete.cases(betas)
+betas <- betas[site_mask,]
+cpg_sites <- cpg_sites[site_mask,]
+# mask out the CpG sites that we don't want to study in this review project.
+
+
+```
+
+```{r}
+
+row.names(cleaned_clinic) <- cleaned_clinic$Tumor_Sample_Barcode
+adapted_methylation <- cleaned_clinic[methylation_clinical$patient,]
+#just as we matched the rna_clincal to the cleaned_clinic, we also need to match methylation_clinical to the cleaned_clinic
+adapted_betas <- betas
+colnames(adapted_betas) <- adapted_methylation$bcr_patient_uuid
+#just like how I did it with the rna_counts, I also need to substitute the column name for betas to the tumor sample barcode from adapted_methylation to ensure I can clean those two together
+adapted_methylation_na_mask <- !is.na(adapted_methylation$bcr_patient_uuid)
+adapted_methylation_cleaned <- adapted_methylation[adapted_methylation_na_mask, ]
+adapted_betas_cleaned <- adapted_betas[,adapted_methylation_na_mask]
+#mask out the NA values in the bcr_patient_uuid in the adapted_methylation
+adapted_methylation_cleaned$smoking_category <- ifelse(adapted_methylation_cleaned$smoking_category == "Heavy exposure", "Heavy exposure", ifelse(adapted_methylation_cleaned$smoking_category == "Non-smoker", "Non-smoker", "Neither"))
+neitherMask <- ifelse(adapted_methylation_cleaned$smoking_category == "Neither", F, T)
+adapted_methylation_cleaned <- adapted_methylation_cleaned[neitherMask, ]
+adapted_betas_cleaned <- adapted_betas_cleaned[,neitherMask]
+#masking all the values other than "Heavy exposure" and "Non-smoker", only keeping the Heavy exposure and non-smoker patients
+
+
+
+
+adapted_methylation_cleaned$Heavy_exposure <- adapted_methylation_cleaned$smoking_category == 'Heavy exposure' # 
+#assigning the column we are going to use the the later analysis.
+
+mval <- t(apply(adapted_betas_cleaned, 1, function(x) log2(x/(1-x))))# finding which site is more differentially methylated
+
+design <- model.matrix(~ Heavy_exposure, data = adapted_methylation_cleaned) # make and interpret the lm model
+fit <- lmFit(mval, design)
+fit2 <- eBayes(fit)
+```
+
+```{r}
+dat <- data.frame(foldchange = fit[["coefficients"]][,2], logPvalue =  -log10((fit2[["p.value"]][,2])), geneName = cpg_sites$gene)
+dat$threshold <- as.factor(abs(dat$foldchange) < 1)
+# extracting the fit model into a dataframe
+#Visualization
+cols <- c("TRUE" = "grey", "FALSE" = "blue")
+ggplot(data=dat, aes(x=foldchange, y = logPvalue, color=threshold)) +
+  geom_point(alpha=.2, size=0.6) +
+  scale_colour_manual(values = cols) +
+  geom_vline(xintercept = 1, colour="#990000", linetype="dashed") + 
+  geom_vline(xintercept = - 1, colour="#990000", linetype="dashed") +
+  geom_hline(yintercept = 2, colour = "#990000", linetype="dashed") +
+  theme(legend.position="none") +
+  xlab("Log2Fold Change") +
+  ylab("-log10 p value") +
+  theme_bw() +
+  theme(legend.position = "none")
+#plotting the data
+
+
+```
+
+```{r}
+upregulated <- results[(results$log2FoldChange > 1.25), 'gene_name']
+hypomethylated <- dat[dat$foldchange < -0.75, 'geneName']
+downregulated <- results[(results$log2FoldChange < -1.25), 'gene_name']
+hypermethylated <- dat[dat$foldchange > 0.75, 'geneName']
+interest_genes1 <- intersect(upregulated, hypomethylated)
+interest_genes2 <- intersect(downregulated, hypomethylated)
+interest_genes3 <- intersect(upregulated, hypermethylated)
+interest_genes4 <- intersect(downregulated, hypermethylated)
+interest_genes1
+interest_genes2
+interest_genes3
+interest_genes4
+#get the four groups of interest genes that intersect between up and down regulation and hyper and hypo methylation. 
+```
+
+```{r}
+rna_tpm <- rna_se@assays@data$tpm_unstrand
+rna_tpm <- as.data.frame(rna_tpm)
+colnames(rna_tpm) <- adapted_clinical$Tumor_Sample_Barcode
+rownames(rna_tpm) <- rna_genes$gene_id
+
+#get rna_tpm data frame and assign the rownames for adapted_clinical to its colname and assign the gene_id column from rna_genes to be the rownames for rna_tpm. rna_tpm is simmilar to rna_counts, but they are normalized, so we can use it for epigenomics analysis
+
+rna_tpm_na_mask <- ifelse(colnames(rna_tpm)%in%adapted_clinical_cleaned$Tumor_Sample_Barcode, T, F)
+rna_tpm_cleaned <- rna_tpm[,rna_tpm_na_mask]
+#mask out the rna_tpm with the adapted_clinical_cleaned data frame.
+rna_tpm_cleaned <- rna_tpm_cleaned[less_20_mask, ]
+#clean the rna_tpm_clean with the rna_counts' less_20_mask
+
+#for gender:
+gender_na_mask <- ifelse(adapted_clinical_cleaned$gender == "[Not Available]", FALSE,
+TRUE)
+rna_tpm_cleaned <- rna_tpm_cleaned[, gender_na_mask]
+
+#for age:
+age_na_mask <- ifelse(adapted_clinical_cleaned$age_at_initial_pathologic_diagnosis == "not reported", FALSE,
+TRUE)
+rna_tpm_cleaned <- rna_tpm_cleaned[, age_na_mask]
+
+#just like cleaning the adapted_clinical_cleaned and rna_counts_cleaned, clean out the na values for rna_tpm for gender and age.
+```
+
+
+```{r}
+setwd("/home1/LUAD/outputs")
+create_methylation_track <- function(gene, dat, methylation450, rna_se, output_dir, sig_threshold=2, fc_cutoff=0.5, output="track.txt", box_offset=10){
+  rna_genes_detailed <- data.frame(rna_se@rowRanges)
+  cpg_sites_detailed <- data.frame(methylation450@rowRanges)
+  row.names(cpg_sites_detailed) <- methylation450@rowRanges@ranges@NAMES
+  
+  gene_mask <- rna_genes_detailed$gene_name == gene
+  if(sum(gene_mask) == 0){
+    print('Gene not found...has it been mispelled or has rna_genes been filtered?')
+  }
+  gene.chr <- rna_genes_detailed[gene_mask, 'seqnames']
+  gene.start <- rna_genes_detailed[gene_mask, 'start']
+  gene.end <- rna_genes_detailed[gene_mask, 'end']
+  
+  cpg_mask <- cpg_sites_detailed$gene == gene
+  cpg_mask[is.na(cpg_mask)] <- FALSE
+  cpg.data <- cpg_sites_detailed[cpg_mask, ]
+  
+  cpg.data$logPvalue <- dat[row.names(cpg.data), 'logPvalue']
+  cpg.data$foldchange <- dat[row.names(cpg.data), 'foldchange']
+  cpg.data<-cpg.data[!is.na(cpg.data$logPvalue),]
+  cpg.data<-cpg.data[!is.na(cpg.data$foldchange),]
+    
+  hypermethylated <- cpg.data[cpg.data$logPvalue >= sig_threshold & cpg.data$foldchange >= fc_cutoff,]
+  hypomethylated <- cpg.data[cpg.data$logPvalue >= sig_threshold & cpg.data$foldchange <= -1*fc_cutoff,]
+  neutral <- cpg.data[cpg.data$logPvalue < sig_threshold | (cpg.data$foldchange < fc_cutoff & cpg.data$foldchange > -1*fc_cutoff),]
+  
+  text <- c()
+  
+  text<-append(text, glue("browser position {gene.chr}:{gene.start-500}-{gene.end+500}\n"))
+  text<-append(text, 'track name=Hypermethylation description="Hypermethylated CpG Sites" color=0,0,255, \n#chrom chromStart chromEnd')
+  if(dim(hypermethylated)[1] > 0){
+    for(site in 1:dim(hypermethylated)[1]){
+      text<-append(text, glue('{hypermethylated[site,"chrm_A"]}   {hypermethylated[site, "start"]-box_offset} {hypermethylated[site, "end"]+box_offset}\n'))
+    }
+  }
+  text<-append(text, 'track name=Hypomethylation description="Hypomethylated CpG Sites" color=255,0,0, \n#chrom chromStart chromEnd')
+  if(dim(hypomethylated)[1] > 0){
+    for(site in 1:dim(hypomethylated)[1]){
+      text<-append(text, glue('{hypomethylated[site,"chrm_A"]}   {hypomethylated[site, "start"]-box_offset} {hypomethylated[site, "end"]+box_offset}\n'))
+    }
+  }
+  text<-append(text, 'track name=Neutral description="Neutral CpG Sites" color=128,128,128, \n#chrom chromStart chromEnd')
+  if(dim(neutral)[1] > 0){
+    for(site in 1:dim(neutral)[1]){
+      text<-append(text, glue('{neutral[site,"chrm_A"]}   {neutral[site, "start"]-box_offset} {neutral[site, "end"]+box_offset}\n'))
+    }
+  }
+  
+  writeLines(text, glue('{output_dir}{gene}_{output}'))
+}
+```
+
+
+```{r}
+setwd("/home1/LUAD/outputs")
+create_methylation_track("gene_name", dat, methylation450, rna_se, output_dir="/home1/LUAD/outputs")
+```
