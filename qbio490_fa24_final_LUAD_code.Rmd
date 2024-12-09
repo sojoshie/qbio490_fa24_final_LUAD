@@ -556,7 +556,7 @@ rna_tpm_cleaned <- rna_tpm_cleaned[, age_na_mask]
 
 
 ```{r}
-setwd("/home1/LUAD/outputs")
+# With help from Wade Boohar
 create_methylation_track <- function(gene, dat, methylation450, rna_se, output_dir, sig_threshold=2, fc_cutoff=0.5, output="track.txt", box_offset=10){
   rna_genes_detailed <- data.frame(rna_se@rowRanges)
   cpg_sites_detailed <- data.frame(methylation450@rowRanges)
@@ -611,6 +611,6 @@ create_methylation_track <- function(gene, dat, methylation450, rna_se, output_d
 
 
 ```{r}
-setwd("/home1/LUAD/outputs")
+# With help from Wade Boohar
 create_methylation_track("gene_name", dat, methylation450, rna_se, output_dir="/home1/LUAD/outputs")
 ```
