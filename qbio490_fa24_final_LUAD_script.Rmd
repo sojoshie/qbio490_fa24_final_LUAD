@@ -163,6 +163,9 @@ KM_plot <- survplot$plot + theme_bw() + theme(axis.title = element_text(size=20)
                                               legend.text = element_text(size=12))
 
 KM_plot
+
+# save plot
+ggsave("/KM_Plot_Smoking_Groups.jpg")
 ```
 Below are the code chunks for genomic data
 
@@ -436,6 +439,8 @@ EnhancedVolcano(results,
                 title = "Definition: Heavy exposure vs. Non Smoker",
                 pointSize = 1.0,
                 labSize = 5.0)
+# saving the plot
+ggsave('/DESEq2_Volcano_Plot_Heavy_Exposure_Non_Smoker.jpg')
 ```
 
 
@@ -507,7 +512,7 @@ ggplot(data=dat, aes(x=foldchange, y = logPvalue, color=threshold)) +
   theme_bw() +
   theme(legend.position = "none")
 #plotting the data
-
+ggsave('/Methylation_Volcano_Plot_Heavy_Exposure_Non_Smoker.jpg')
 
 ```
 
